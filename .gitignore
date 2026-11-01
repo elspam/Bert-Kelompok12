@@ -1,0 +1,40 @@
+# [LUHUNG] Aturan ignore repositori
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+
+# Virtual environments & env vars
+.venv/
+venv/
+env/
+.env
+
+# IDE & OS
+.vscode/
+.idea/
+.ipynb_checkpoints/
+.DS_Store
+Thumbs.db
+
+# Data (gitignored, tetap simpan .gitkeep)
+data/raw/*
+!data/raw/.gitkeep
+data/processed/*
+!data/processed/.gitkeep
+
+# Checkpoints (gitignored, tetap simpan .gitkeep)
+checkpoints/*
+!checkpoints/.gitkeep
+*.pt
+*.pth
+
+# Training logs mentah (gitignored, tetap simpan .gitkeep)
+# Catatan: outputs/figures/*.png sengaja TIDAK di-ignore agar ikut ter-commit
+outputs/logs/*
+!outputs/logs/.gitkeep
+

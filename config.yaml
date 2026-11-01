@@ -1,0 +1,68 @@
+# [LUHUNG] Konfigurasi Hyperparameter & Path — BERT-from-Scratch (SPEC v1.0)
+# Catatan: Perubahan angka/desain wajib mengikuti prosedur rapat di SPEC.md §7.
+
+project:
+  name: "bert-from-scratch-kelompok12"
+  task: "mlm"
+  seed: 42
+
+paths:
+  raw_data_dir: "data/raw"
+  processed_data_dir: "data/processed"
+  vocab_path: "data/processed/vocab.json"
+  checkpoint_dir: "checkpoints"
+  figures_dir: "outputs/figures"
+  logs_dir: "outputs/logs"
+
+data:
+  dataset_name: "wikitext"
+  dataset_config: "wikitext-2-raw-v1"
+  tokenizer_type: "word_level"
+  vocab_size: 30000
+  max_seq_length: 128
+  special_tokens:
+    pad_token: "[PAD]"
+    unk_token: "[UNK]"
+    cls_token: "[CLS]"
+    sep_token: "[SEP]"
+    mask_token: "[MASK]"
+  special_token_ids:
+    pad_token_id: 0
+    unk_token_id: 1
+    cls_token_id: 2
+    sep_token_id: 3
+    mask_token_id: 4
+  mlm:
+    mlm_probability: 0.15
+    mask_replace_prob: 0.80
+    random_replace_prob: 0.10
+    keep_original_prob: 0.10
+    ignore_index: -100
+
+model:
+  vocab_size: 30000
+  hidden_size: 256
+  num_layers: 6
+  num_heads: 8              # head_dim = 256 / 8 = 32 (wajib habis dibagi)
+  intermediate_size: 1024   # 4 * hidden_size
+  dropout: 0.1
+  activation: "gelu"
+  max_seq_length: 128
+  type_vocab_size: 2        # segment A / B
+  pad_token_id: 0
+  ignore_index: -100
+  tie_weights: false        # default false sesuai SPEC.md §3
+  layer_norm_eps: 1.0e-12
+
+training:
+  batch_size: 32            # turunkan ke 16 jika OOM di Colab T4
+  learning_rate: 5.0e-4
+  optimizer: "adamw"
+  weight_decay: 0.01
+  num_epochs: 10
+  warmup_ratio: 0.10        # 10% dari total training steps
+  lr_schedule: "linear"     # linear decay setelah warmup
+  gradient_clip: 1.0
+  mixed_precision: true     # FP16 (AMP) direkomendasikan untuk T4
+  ignore_index: -100
+  seed: 42
