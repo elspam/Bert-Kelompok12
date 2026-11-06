@@ -3,19 +3,17 @@
 from .model import (
     BERT,
     BERTEmbeddings,
-    BERTEncoder,
-    EncoderLayer,
     MLMHead,
-    MLMOutput,
-    MultiHeadAttention,
+    MultiHeadSelfAttention,
+    PositionwiseFeedForward,
+    TransformerEncoderLayer,
 )
 
 __all__ = [
-    "MultiHeadAttention",
-    "EncoderLayer",
     "BERTEmbeddings",
-    "BERTEncoder",
+    "MultiHeadSelfAttention",
+    "PositionwiseFeedForward",
+    "TransformerEncoderLayer",
     "MLMHead",
-    "MLMOutput",
     "BERT",
 ]

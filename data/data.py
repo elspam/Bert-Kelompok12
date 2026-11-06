@@ -1,256 +1,363 @@
-"""[BAGAS] Dataset, DataLoader, dan masking pipeline untuk MLM."""
 """
-data/data.py — Data pipeline MLM (SPEC v1.0 §2, §4, §5).
+Data pipeline for BERT MLM pre-training (Member 1 — Data).
 
-Urutan pemakaian (jalankan dari root repo):
-    cfg = load_config("config.yaml")
-    lines = load_dataset(cfg)             # siapkan data/raw + data/processed
-    tok = build_tokenizer(cfg)            # dari data/tokenizer.py (vocab dari train)
-    ds = MLMDataset(lines["train"], tok, cfg, split="train")
-    dl = make_dataloader(ds, cfg)
-
-Kontrak output tiap sampel (dict, semua torch.long, shape (L,) dengan L=128):
-    input_ids, attention_mask, token_type_ids, labels
-Setelah batching: (B, L).
+Contract summary (see SPEC.md for full details):
+  Special token IDs: [PAD]=0, [UNK]=1, [CLS]=2, [SEP]=3, [MASK]=4
+  Output batch keys: input_ids, attention_mask, token_type_ids, labels
+  All tensors: shape (B, max_seq_len), dtype torch.long
+  Unmasked positions in labels are set to -100.
 """
 
-import os
+from __future__ import annotations
+
+from collections import Counter
+import json
+from pathlib import Path
 import re
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import torch
 from torch.utils.data import DataLoader, Dataset
 
-from data.tokenizer import NUM_SPECIAL, SPLIT_FILES, WordTokenizer, build_tokenizer, load_config
+SPECIAL_TOKENS: List[Tuple[str, int]] = [
+    ("[PAD]", 0),
+    ("[UNK]", 1),
+    ("[CLS]", 2),
+    ("[SEP]", 3),
+    ("[MASK]", 4),
+]
 
-SPLITS = ("train", "validation", "test")
-RAW_FILES = {s: f"wikitext2_{s}.txt" for s in SPLITS}
+IGNORE_INDEX: int = -100
 
 
-# --------------------------------------------------------------------------- #
-# 1. Download + cleaning
-# --------------------------------------------------------------------------- #
-_WS = re.compile(r"\s+")
+class Vocab:
+    """Word-level vocabulary with fixed special-token IDs (SPEC.md §3)."""
+
+    def __init__(self, token_to_id: Dict[str, int]) -> None:
+        for tok, idx in SPECIAL_TOKENS:
+            if token_to_id.get(tok) != idx:
+                raise ValueError(
+                    f"Special token {tok!r} must have ID {idx}, "
+                    f"got {token_to_id.get(tok)}"
+                )
+        self.token_to_id: Dict[str, int] = dict(token_to_id)
+        self.id_to_token: Dict[int, str] = {i: t for t, i in self.token_to_id.items()}
+
+    @property
+    def pad_token_id(self) -> int:
+        return 0
+
+    @property
+    def unk_token_id(self) -> int:
+        return 1
+
+    @property
+    def cls_token_id(self) -> int:
+        return 2
+
+    @property
+    def sep_token_id(self) -> int:
+        return 3
+
+    @property
+    def mask_token_id(self) -> int:
+        return 4
+
+    def __len__(self) -> int:
+        return len(self.token_to_id)
+
+    def encode(self, tokens: Iterable[str]) -> List[int]:
+        unk = self.unk_token_id
+        lut = self.token_to_id
+        return [lut.get(t, unk) for t in tokens]
+
+    def decode(self, ids: Iterable[int]) -> List[str]:
+        return [self.id_to_token.get(int(i), "[UNK]") for i in ids]
+
+    def save(self, path: str | Path) -> None:
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", encoding="utf-8") as f:
+            json.dump(self.token_to_id, f, ensure_ascii=False, indent=2)
+
+    @classmethod
+    def load(cls, path: str | Path) -> "Vocab":
+        with Path(path).open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict) and "token_to_id" in data:
+            data = data["token_to_id"]
+        return cls({k: int(v) for k, v in data.items()})
 
 
-def clean_line(line):
-    """
-    Bersihkan satu baris mentah WikiText. Return "" jika baris harus dibuang
-    (kosong / judul diawali "=").
-    Tanda baca TIDAK dirapatkan ke kata: hasil cukup di-.split().
-    """
+_TOKEN_RE = re.compile(r"\w+|[^\w\s]", re.UNICODE)
+
+
+def clean_line(line: str) -> str:
+    """Lowercase + basic whitespace/token normalization for a single line."""
     line = line.strip()
-    if not line or line.startswith("="):
+    if not line or (line.startswith("=") and line.endswith("=")):
         return ""
-    line = re.sub(r"\s*@([-,.])@\s*", r"\1", line)
-    line = _WS.sub(" ", line).strip()
-    return line.lower()
+    tokens = _TOKEN_RE.findall(line.lower())
+    return " ".join(tokens)
 
 
-def _hf_dataset_name(cfg):
-    name = cfg["data"]["dataset_name"]
-    # "wikitext" tanpa namespace dapat memicu HfUriError
-    return name if "/" in name else f"Salesforce/{name}"
+def build_vocab(
+    texts: Iterable[str],
+    vocab_size: int = 30000,
+    min_freq: int = 2,
+) -> Vocab:
+    """Build a word-level Vocab from an iterable of whitespace-tokenized lines."""
+    counter: Counter[str] = Counter()
+    for line in texts:
+        counter.update(line.split())
+
+    special_set = {t for t, _ in SPECIAL_TOKENS}
+    for s in special_set:
+        counter.pop(s, None)
+
+    token_to_id: Dict[str, int] = {t: i for t, i in SPECIAL_TOKENS}
+    budget = max(0, vocab_size - len(SPECIAL_TOKENS))
+
+    for tok, freq in counter.most_common():
+        if len(token_to_id) - len(SPECIAL_TOKENS) >= budget:
+            break
+        if freq < min_freq:
+            break
+        token_to_id[tok] = len(token_to_id)
+
+    return Vocab(token_to_id)
 
 
-def _download_raw(cfg):
-    """Unduh dengan library `datasets` (satu-satunya tempat ia dipakai)."""
-    from datasets import load_dataset as hf_load_dataset  # import lokal sengaja
-
-    raw_dir = cfg["paths"]["raw_data_dir"]
-    os.makedirs(raw_dir, exist_ok=True)
-    ds = hf_load_dataset(_hf_dataset_name(cfg), cfg["data"]["dataset_config"])
-    for split in SPLITS:
-        path = os.path.join(raw_dir, RAW_FILES[split])
-        with open(path, "w", encoding="utf-8") as f:
-            for row in ds[split]:
-                f.write(row["text"].rstrip("\n") + "\n")
-        print(f"[data] raw {split:<10} -> {path}")
+def _chunk(tokens: List[str], max_body: int) -> List[List[str]]:
+    return [tokens[i : i + max_body] for i in range(0, len(tokens), max_body)]
 
 
-def _clean_split(raw_path, clean_path):
-    n_in, n_out = 0, 0
-    with open(raw_path, "r", encoding="utf-8") as fin, open(clean_path, "w", encoding="utf-8") as fout:
-        for line in fin:
-            n_in += 1
-            c = clean_line(line)
-            if c:
-                fout.write(c + "\n")
-                n_out += 1
-    print(f"[data] clean {os.path.basename(clean_path):<22} {n_in:>7,} -> {n_out:>7,} baris")
+def mask_tokens(
+    input_ids: torch.Tensor,
+    vocab: Vocab,
+    mlm_prob: float = 0.15,
+    generator: Optional[torch.Generator] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Apply BERT 80/10/10 dynamic MLM masking on a 1D or 2D tensor of token IDs.
 
-
-def load_dataset(cfg=None):
+    Special tokens ([PAD], [UNK], [CLS], [SEP], [MASK]) are NEVER selected for masking.
+    Unmasked positions in `labels` are set to -100.
     """
-    Pastikan data/processed/{train,validation,test}_clean.txt ada.
-    - File bersih sudah ada  -> tidak unduh/bersihkan ulang.
-    - Raw ada, bersih belum  -> bersihkan saja.
-    - Raw belum ada          -> unduh dulu.
-    Return: {split: list[str]} baris bersih (satu paragraf per baris).
-    """
-    cfg = cfg or load_config()
-    raw_dir = cfg["paths"]["raw_data_dir"]
-    proc_dir = cfg["paths"]["processed_data_dir"]
-    os.makedirs(proc_dir, exist_ok=True)
+    ids = input_ids.clone()
+    labels = input_ids.clone()
 
-    clean_paths = {s: os.path.join(proc_dir, SPLIT_FILES[s]) for s in SPLITS}
-    raw_paths = {s: os.path.join(raw_dir, RAW_FILES[s]) for s in SPLITS}
-
-    if not all(os.path.exists(p) for p in clean_paths.values()):
-        if not all(os.path.exists(p) for p in raw_paths.values()):
-            _download_raw(cfg)
-        for s in SPLITS:
-            _clean_split(raw_paths[s], clean_paths[s])
-    else:
-        print("[data] file bersih sudah ada, lewati unduh/cleaning.")
-
-    out = {}
-    for s, p in clean_paths.items():
-        with open(p, "r", encoding="utf-8") as f:
-            out[s] = [ln.strip() for ln in f if ln.strip()]
-    return out
-
-
-# --------------------------------------------------------------------------- #
-# 2. Masking MLM (fungsi murni -> mudah diuji)
-# --------------------------------------------------------------------------- #
-def mask_tokens(input_ids, tokenizer, cfg, generator=None):
-    """
-    input_ids: LongTensor (...,) asli (sudah ada [CLS]/[SEP]/[PAD]).
-    Return (masked_input_ids, labels), keduanya LongTensor shape sama.
-
-    - Kandidat = bukan [PAD]/[CLS]/[SEP]/[MASK].
-    - Tiap kandidat dipilih dengan peluang mlm_probability (15%).
-    - Terpilih: 80% -> [MASK], 10% -> ID acak di [5, len(tokenizer)), 10% tetap.
-    - labels = token asli di semua posisi TERPILIH (termasuk yang dibiarkan),
-      selain itu ignore_index (-100).
-    """
-    mlm = cfg["data"]["mlm"]
-    p_select = mlm["mlm_probability"]
-    p_mask = mlm["mask_replace_prob"]
-    p_rand = mlm["random_replace_prob"]
-    p_keep = mlm["keep_original_prob"]
-    ignore_index = mlm["ignore_index"]
-    if abs(p_mask + p_rand + p_keep - 1.0) > 1e-6:
-        raise ValueError("mask_replace_prob + random_replace_prob + keep_original_prob harus = 1.")
-    vocab_active = len(tokenizer)
-    if vocab_active <= NUM_SPECIAL:
-        raise ValueError("Vocab hanya berisi special token; tidak ada ID acak yang valid.")
-
+    # Exclude ALL special tokens including [UNK] (ID=1) from MLM masking targets
     special = (
-        (input_ids == tokenizer.pad_token_id)
-        | (input_ids == tokenizer.cls_token_id)
-        | (input_ids == tokenizer.sep_token_id)
-        | (input_ids == tokenizer.mask_token_id)
+        (input_ids == vocab.pad_token_id)
+        | (input_ids == vocab.unk_token_id)
+        | (input_ids == vocab.cls_token_id)
+        | (input_ids == vocab.sep_token_id)
+        | (input_ids == vocab.mask_token_id)
     )
-    selected = (torch.rand(input_ids.shape, generator=generator) < p_select) & ~special
 
-    labels = torch.full_like(input_ids, ignore_index)
-    labels[selected] = input_ids[selected]
+    prob = torch.full(ids.shape, mlm_prob, dtype=torch.float)
+    prob.masked_fill_(special, 0.0)
+    masked_indices = torch.bernoulli(prob, generator=generator).bool()
 
-    u = torch.rand(input_ids.shape, generator=generator)
-    to_mask = selected & (u < p_mask)
-    to_rand = selected & (u >= p_mask) & (u < p_mask + p_rand)
-    # sisanya (selected & u >= p_mask + p_rand) dibiarkan apa adanya
+    # Ensure at least 1 valid non-special token is masked per sequence if possible
+    if ids.dim() == 1:
+        if not masked_indices.any():
+            valid_pos = (~special).nonzero(as_tuple=False).view(-1)
+            if len(valid_pos) > 0:
+                pick = valid_pos[
+                    torch.randint(len(valid_pos), (1,), generator=generator).item()
+                ]
+                masked_indices[pick] = True
 
-    random_ids = torch.randint(NUM_SPECIAL, vocab_active, input_ids.shape, generator=generator)
-    masked = input_ids.clone()
-    masked[to_mask] = tokenizer.mask_token_id
-    masked[to_rand] = random_ids[to_rand]
-    return masked, labels
+    labels[~masked_indices] = IGNORE_INDEX
 
+    # 80% of the time, replace masked input tokens with [MASK]
+    replace_prob = torch.rand(ids.shape, generator=generator)
+    indices_replaced = (replace_indices := (replace_prob < 0.8)) & masked_indices
+    ids[indices_replaced] = vocab.mask_token_id
 
-# --------------------------------------------------------------------------- #
-# 3. Dataset
-# --------------------------------------------------------------------------- #
-def _chunk(words, size):
-    for i in range(0, len(words), size):
-        yield words[i : i + size]
+    # 10% of the time, replace masked input tokens with random regular word (ID >= 5)
+    indices_random = (replace_prob >= 0.8) & (replace_prob < 0.9) & masked_indices
+    low_id = 5 if len(vocab) > 5 else 0
+    random_words = torch.randint(
+        low_id, len(vocab), ids.shape, dtype=torch.long, generator=generator
+    )
+    ids[indices_random] = random_words[indices_random]
+
+    # Remaining 10%: keep original token unchanged
+    return ids, labels
 
 
 class MLMDataset(Dataset):
-    """
-    Tiap paragraf dipecah per (max_seq_length - 2) kata, di-encode menjadi
-    [CLS] ... [SEP] + [PAD] sampai max_seq_length. Token asli disimpan di
-    `self.token_ids` (N, L); masking dilakukan di __getitem__.
+    """Pre-training dataset producing fixed-length padded MLM examples.
 
-    split == "train"       : masking acak baru setiap sampel diambil.
-    split == validation/test: masking dikunci per indeks (seed = seed config + idx).
+    Uses token-stream packing across lines so sequences are densely packed
+    with bidirectional context up to `max_seq_len - 2` tokens.
     """
 
-    def __init__(self, lines, tokenizer, cfg, split="train"):
-        if split not in SPLITS:
-            raise ValueError(f"split harus salah satu dari {SPLITS}")
-        self.tokenizer = tokenizer
-        self.cfg = cfg
-        self.split = split
-        self.is_train = split == "train"
-        self.max_seq_length = cfg["data"]["max_seq_length"]
-        self.seed = cfg["project"]["seed"]
-        body = self.max_seq_length - 2
+    def __init__(
+        self,
+        lines: Iterable[str],
+        vocab: Vocab,
+        max_seq_len: int = 128,
+        mlm_prob: float = 0.15,
+        pack_sequences: bool = True,
+        min_seq_tokens: int = 8,
+    ) -> None:
+        self.vocab = vocab
+        self.max_seq_len = max_seq_len
+        self.mlm_prob = mlm_prob
 
-        rows = []
-        for line in lines:
-            for piece in _chunk(line.split(), body):
-                rows.append(
-                    tokenizer.encode(
-                        " ".join(piece),
-                        add_special_tokens=True,
-                        max_length=self.max_seq_length,
-                        padding=True,
-                    )
-                )
-        self.token_ids = torch.tensor(rows, dtype=torch.long)  # (N, L)
+        body = max_seq_len - 2  # reserve [CLS] and [SEP]
+        self.examples: List[List[int]] = []
 
-    def __len__(self):
-        return self.token_ids.shape[0]
+        if pack_sequences:
+            buffer: List[str] = []
+            for line in lines:
+                toks = line.split()
+                if not toks:
+                    continue
+                buffer.extend(toks)
+                while len(buffer) >= body:
+                    piece = buffer[:body]
+                    buffer = buffer[body:]
+                    self.examples.append(vocab.encode(piece))
+            if len(buffer) >= min_seq_tokens:
+                self.examples.append(vocab.encode(buffer[:body]))
+        else:
+            for line in lines:
+                toks = line.split()
+                if not toks:
+                    continue
+                for piece in _chunk(toks, body):
+                    if len(piece) >= min_seq_tokens:
+                        self.examples.append(vocab.encode(piece))
 
-    def __getitem__(self, idx):
-        original = self.token_ids[idx]  # (L,)
-        attention_mask = (original != self.tokenizer.pad_token_id).long()
+    def __len__(self) -> int:
+        return len(self.examples)
 
-        generator = None
-        if not self.is_train:
-            generator = torch.Generator()
-            generator.manual_seed(self.seed + int(idx))
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        body_ids = self.examples[idx]
+        seq_ids = [self.vocab.cls_token_id] + body_ids + [self.vocab.sep_token_id]
+        real_len = len(seq_ids)
+        pad_len = self.max_seq_len - real_len
 
-        input_ids, labels = mask_tokens(original, self.tokenizer, self.cfg, generator)
+        input_ids = torch.tensor(
+            seq_ids + [self.vocab.pad_token_id] * pad_len, dtype=torch.long
+        )
+        attention_mask = torch.tensor(
+            [1] * real_len + [0] * pad_len, dtype=torch.long
+        )
+        token_type_ids = torch.zeros(self.max_seq_len, dtype=torch.long)
+
+        masked_ids, labels = mask_tokens(input_ids, self.vocab, self.mlm_prob)
+
         return {
-            "input_ids": input_ids,  # (L,) long
-            "attention_mask": attention_mask,  # (L,) long
-            "token_type_ids": torch.zeros_like(original),  # (L,) long
-            "labels": labels,  # (L,) long
+            "input_ids": masked_ids,
+            "attention_mask": attention_mask,
+            "token_type_ids": token_type_ids,
+            "labels": labels,
         }
 
 
-# --------------------------------------------------------------------------- #
-# 4. DataLoader
-# --------------------------------------------------------------------------- #
-def make_dataloader(dataset, cfg, shuffle=None, num_workers=0):
-    """
-    Batch default -> dict dengan tensor (B, L) bertipe long.
-    shuffle default: True untuk train, False untuk validation/test.
-    """
-    if shuffle is None:
-        shuffle = dataset.is_train
-    g = torch.Generator()
-    g.manual_seed(cfg["training"]["seed"])
-    return DataLoader(
-        dataset,
-        batch_size=cfg["training"]["batch_size"],
-        shuffle=shuffle,
-        generator=g if shuffle else None,
-        num_workers=num_workers,
-        pin_memory=torch.cuda.is_available(),
-        drop_last=False,
+def _read_lines(path: Path) -> List[str]:
+    with path.open("r", encoding="utf-8") as f:
+        return [ln.strip() for ln in f if ln.strip()]
+
+
+def prepare_wikitext2(
+    processed_dir: str | Path,
+    vocab_size: int = 30000,
+    min_freq: int = 2,
+) -> Vocab:
+    """Download WikiText-2 via HuggingFace `datasets`, clean it, and save artifacts."""
+    from datasets import load_dataset  # lazy import so unit tests don't need it
+
+    processed_dir = Path(processed_dir)
+    processed_dir.mkdir(parents=True, exist_ok=True)
+
+    ds = load_dataset("wikitext", "wikitext-2-raw-v1")
+    split_map = {
+        "train": "train_clean.txt",
+        "validation": "validation_clean.txt",
+        "test": "test_clean.txt",
+    }
+
+    cleaned_splits: Dict[str, List[str]] = {}
+    for split, fname in split_map.items():
+        cleaned = [c for raw in ds[split]["text"] if (c := clean_line(raw))]
+        cleaned_splits[split] = cleaned
+        out = processed_dir / fname
+        with out.open("w", encoding="utf-8") as f:
+            f.write("\n".join(cleaned) + "\n")
+
+    vocab = build_vocab(
+        cleaned_splits["train"], vocab_size=vocab_size, min_freq=min_freq
     )
+    vocab.save(processed_dir / "vocab.json")
+    return vocab
 
 
-# --------------------------------------------------------------------------- #
+def build_dataloaders(
+    config: dict,
+) -> Tuple[DataLoader, DataLoader, DataLoader, Vocab]:
+    """Entry point used by Member 3 (`training/train.py`).
+
+    If processed files are missing in `data.processed_dir`, automatically
+    downloads and prepares WikiText-2 first.
+    """
+    data_cfg = config["data"]
+    train_cfg = config["training"]
+
+    proc_dir = Path(data_cfg["processed_dir"])
+    vocab_path = proc_dir / "vocab.json"
+    train_path = proc_dir / "train_clean.txt"
+    val_path = proc_dir / "validation_clean.txt"
+    test_path = proc_dir / "test_clean.txt"
+
+    if not (vocab_path.exists() and train_path.exists()):
+        vocab = prepare_wikitext2(
+            proc_dir,
+            vocab_size=int(data_cfg.get("vocab_size", 30000)),
+            min_freq=int(data_cfg.get("min_freq", 2)),
+        )
+    else:
+        vocab = Vocab.load(vocab_path)
+
+    max_len = int(data_cfg.get("max_seq_len", 128))
+    mlm_prob = float(data_cfg.get("mlm_probability", data_cfg.get("mlm_prob", 0.15)))
+    bs = int(train_cfg.get("batch_size", 32))
+    nw = int(train_cfg.get("num_workers", data_cfg.get("num_workers", 2)))
+
+    train_ds = MLMDataset(_read_lines(train_path), vocab, max_len, mlm_prob)
+    val_ds = MLMDataset(_read_lines(val_path), vocab, max_len, mlm_prob)
+    test_ds = MLMDataset(_read_lines(test_path), vocab, max_len, mlm_prob)
+
+    common = dict(batch_size=bs, num_workers=nw, pin_memory=torch.cuda.is_available())
+    train_loader = DataLoader(train_ds, shuffle=True, **common)
+    val_loader = DataLoader(val_ds, shuffle=False, **common)
+    test_loader = DataLoader(test_ds, shuffle=False, **common)
+
+    return train_loader, val_loader, test_loader, vocab
+
+
+def create_dataloaders(
+    config: dict,
+) -> Tuple[DataLoader, DataLoader, DataLoader]:
+    """Helper returning (train_loader, val_loader, test_loader) for notebook & training."""
+    train_loader, val_loader, test_loader, vocab = build_dataloaders(config)
+    if "model" in config:
+        config["model"]["vocab_size"] = len(vocab)
+    return train_loader, val_loader, test_loader
+
+
 if __name__ == "__main__":
-    cfg = load_config("config.yaml")
-    lines = load_dataset(cfg)
-    tok = build_tokenizer(cfg)
-    for split in SPLITS:
-        ds = MLMDataset(lines[split], tok, cfg, split=split)
-        batch = next(iter(make_dataloader(ds, cfg)))
-        print(f"[{split}] sampel={len(ds):,} | " + ", ".join(f"{k}:{tuple(v.shape)}/{v.dtype}" for k, v in batch.items()))
+    import yaml
+
+    with open("config.yaml", "r", encoding="utf-8") as f:
+        cfg = yaml.safe_load(f)
+    tr, va, te, vc = build_dataloaders(cfg)
+    batch = next(iter(tr))
+    print(f"Vocab size: {len(vc)}")
+    for k, v in batch.items():
+        print(f"  {k}: shape={tuple(v.shape)}, dtype={v.dtype}")
