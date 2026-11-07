@@ -345,7 +345,7 @@ Pada eksekusi awal baseline (`tie_weights=False`, `lr_schedule="linear"`, tanpa 
 LOG INTERAKSI LLM - KELOMPOK 12
 • Tanggal Sesi: 06/11/2026
 • Target Modul: `model/model.py`, `training/utils.py`, `training/train.py`, `config.yaml`, dan `BERT_Kelompok12_Anggota3_Training_dan_Tuning.ipynb` (Penanganan *Unigram Plateau* & Optimasi Pelatihan Panjang — Anggota 3: Bima)
-• Tautan Sesi Chat: [Sertakan tautan share link AI]
+• Tautan Sesi Chat: (https://share.gemini.google/CEIyGoSC1jMY) 
 
 KRONOLOGI PROMPT & RESPONS:
 1. TAHAP INISIASI (Meminta Kode Awal / Strategi Optimasi Lanjutan)
@@ -390,4 +390,32 @@ Saat menyelaraskan sel baru notebook dengan modul `data/data.py`, `model/__init_
 
 ---
 
-.... <LANJUT YA GESSS>
+
+## 9. Pemeriksaan Repository dan Pembaruan Dokumentasi ##
+
+- **Tanggal:** 07/11/2026
+- **Target Modul:** Integrasi hasil pekerjaan anggota dan dokumentasi proyek.
+- **Tautan Chat:** https://claude.ai/share/7d5b8cc4-1c26-4f00-ac1b-b2bfa7c2bc9c 
+
+**Prompt Kelompok:**
+Meminta bantuan untuk proses pengintegrasian seluruh hasil pekerjaan tim dalam sebuah laporan dan dokumentasi.
+
+**Alasan Khusus:**
+Diperlukan panduan untuk mengintegrasikan hasil pekerjaan seluruh anggota kelompok ke dalam dokumentasi proyek agar setiap proses pengembangan dapat ditelusuri dengan jelas. Selain itu, perlu dipastikan bahwa interaksi dengan LLM, proses debugging, perubahan kode, dan hasil implementasi terdokumentasi secara konsisten serta sesuai dengan kondisi repository yang sebenarnya.
+
+**Output Model:**
+LLM memberikan panduan integrasi dokumentasi proyek yang mencakup:
+
+1. Struktur repository untuk memisahkan file implementasi dan dokumentasi.
+
+2. Matriks keterlacakan yang menghubungkan komponen, anggota penanggung jawab, file kode, entri log, bukti percakapan LLM, dan bagian laporan.
+
+3. Alur kerja dokumentasi, mulai dari pengumpulan bukti percakapan, pencatatan log, verifikasi riwayat commit, hingga penyusunan laporan.
+
+4. Lima pertanyaan panduan untuk mengumpulkan informasi dari setiap anggota mengenai implementasi, prompt, debugging, evaluasi saran LLM, dan hasil akhir.
+
+5. Checklist pemeriksaan konsistensi antara dokumentasi, kode program, hiperparameter, dan bukti interaksi LLM.
+
+**Keputusan Kelompok:**
+Kelompok menggunakan panduan tersebut sebagai acuan dalam proses integrasi dan penyusunan dokumentasi akhir. Dokumentasi difokuskan pada tiga bagian utama, yaitu log.md, laporan.md, dan folder llm_chats/. Setiap anggota diminta menyediakan bukti interaksi LLM beserta ringkasan proses pengerjaannya agar hasil implementasi dapat diverifikasi dan dicantumkan secara tepat dalam laporan akhir.
+
